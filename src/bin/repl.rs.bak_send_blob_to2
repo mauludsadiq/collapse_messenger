@@ -1,0 +1,380 @@
+use std::cell::RefCell;
+use std::io::{Write};
+use std::rc::Rc;
+
+use collapse_messenger::content::{Content, StatusEvent, RetinaBody};
+use collapse_messenger::fuse::fuse_fixations;
+use collapse_messenger::node::NodeMessenger;
+use collapse_messenger::phi::Evidence;
+use collapse_messenger::transport_mem::MemoryTransport;
+use collapse_messenger::types::{Digest, PubKey, zero_digest};
+
+/// We'll hold three named nodes in a tiny struct for convenience.
+struct Net {
+    a: NodeMessenger,
+    b: NodeMessenger,
+    c: NodeMessenger,
+}
+
+impl Net {
+    fn new() -> Self {
+        let bus = Rc::new(RefCell::new(MemoryTransport::new()));
+
+        let mut a = NodeMessenger::new(PubKey("A".into()), bus.clone());
+        let mut b = NodeMessenger::new(PubKey("B".into()), bus.clone());
+        let mut c = NodeMessenger::new(PubKey("C".into()), bus.clone());
+
+        a.add_peer(PubKey("B".into()));
+        a.add_peer(PubKey("C".into()));
+        b.add_peer(PubKey("A".into()));
+        b.add_peer(PubKey("C".into()));
+        c.add_peer(PubKey("A".into()));
+        c.add_peer(PubKey("B".into()));
+
+        Net { a, b, c }
+    }
+
+    fn node_mut(&mut self, who: &str) -> Option<&mut NodeMessenger> {
+        match who {
+            "A" | "a" => Some(&mut self.a),
+            "B" | "b" => Some(&mut self.b),
+            "C" | "c" => Some(&mut self.c),
+            _ => None,
+        }
+    }
+
+    fn node_ref(&self, who: &str) -> Option<&NodeMessenger> {
+        match who {
+            "A" | "a" => Some(&self.a),
+            "B" | "b" => Some(&self.b),
+            "C" | "c" => Some(&self.c),
+            _ => None,
+        }
+    }
+
+    /// Helper: get last digest in a node's inbox (like "what am I replying to?")
+    fn last_digest(&self, who: &str) -> Option<Digest> {
+        self.node_ref(who)
+            .and_then(|n| n.inbox.last().map(|m| m.digest.clone()))
+    }
+
+    /// CLI: send text
+    /// usage: send_text FROM root|last MESSAGE...
+    /// PARENT? can be "root" or "last"
+    fn cmd_send_text(&mut self, from: &str, parent_sel: &str, msg_words: &[&str]) {
+        let parent = match parent_sel {
+            "root" => zero_digest(),
+            "last" => self.last_digest(from).unwrap_or_else(zero_digest),
+            other => {
+                eprintln!("[warn] unknown parent selector {}, using root", other);
+                zero_digest()
+            }
+        };
+
+        let body = msg_words.join(" ");
+        if let Some(n) = self.node_mut(from) {
+            n.send(parent, Evidence::DraftText { raw: body });
+        } else {
+            eprintln!("no such node {}", from);
+        }
+    }
+
+    /// CLI: send_retina FROM PARENT?
+    /// PARENT? = root | last
+    /// (dummy retinal capture for now)
+    fn cmd_send_retina(&mut self, from: &str, parent_sel: &str) {
+        let parent = match parent_sel {
+            "root" => zero_digest(),
+            "last" => self.last_digest(from).unwrap_or_else(zero_digest),
+            _ => zero_digest(),
+        };
+
+        if let Some(n) = self.node_mut(from) {
+            n.send(
+                parent,
+                Evidence::RawRetinaCapture {
+                    samples: vec![(0.5,0.5,0.9), (0.6,0.5,0.8)],
+                    lambda: 0.1,
+                    foveation_cfg: (0.15, 0.5, 0.5),
+                    basis_cfg: (32, 32),
+                    cert_seed: 123,
+                },
+            );
+        } else {
+            eprintln!("no such node {}", from);
+        }
+    }
+
+    /// CLI: ack FROM root|last delivered|read
+    fn cmd_ack(&mut self, from: &str, parent_sel: &str, kind: &str) {
+        let parent = match parent_sel {
+            "root" => zero_digest(),
+            "last" => self.last_digest(from).unwrap_or_else(zero_digest),
+            _ => zero_digest(),
+        };
+
+        if let Some(n) = self.node_mut(from) {
+            match kind {
+                "delivered" => n.ack_delivered(parent),
+                "read" => n.ack_read(parent),
+                _ => eprintln!("ack kind must be delivered|read"),
+            }
+        } else {
+            eprintln!("no such node {}", from);
+        }
+    }
+
+    /// CLI: poll WHO
+    /// drains queued messages for that node from the bus into its inbox
+    fn cmd_poll(&mut self, who: &str) {
+        if let Some(n) = self.node_mut(who) {
+            n.poll();
+        } else {
+            eprintln!("no such node {}", who);
+        }
+    }
+
+    /// CLI: inbox WHO
+    /// prints ordered inbox for WHO
+    fn cmd_inbox(&self, who: &str) {
+        if let Some(n) = self.node_ref(who) {
+            println!("--- inbox {} ---", who);
+            for (i, m) in n.inbox.iter().enumerate() {
+                print!("#{} ", i);
+                print_digest(&m.digest);
+                match &m.content {
+                    Content::Text(t) => {
+                        println!(" TEXT from {}: {}", m.sender.0, t.canonical_text);
+                    }
+                    Content::Retina(r) => {
+                        println!(
+                            " RETINA from {}: λ={}, σ={}, a_hat.len={} psnr={}dB",
+                            m.sender.0,
+                            r.lambda,
+                            r.foveation.sigma,
+                            r.a_hat.len(),
+                            r.cert.psnr_equiv_db
+                        );
+                    }
+                    Content::Status(StatusEvent::Delivered { digest_ack, at }) => {
+                        print!(" DELIVERED by {} ack=", m.sender.0);
+                        print_digest_inline(digest_ack);
+                        println!("@{}", at.0);
+                    }
+                    Content::Status(StatusEvent::Read { digest_ack, at }) => {
+                        print!(" READ by {} ack=", m.sender.0);
+                        print_digest_inline(digest_ack);
+                        println!("@{}", at.0);
+                    }
+                    Content::Status(StatusEvent::TypingStart) => {
+                        println!(
+                            " TYPING_START by {}",
+                            m.sender.0
+                        );
+                    }
+                    Content::Status(StatusEvent::TypingStop) => {
+                        println!(
+                            " TYPING_STOP by {}",
+                            m.sender.0
+                        );
+                    }
+                }
+            }
+        } else {
+            eprintln!("no such node {}", who);
+        }
+    }
+
+    /// CLI: rep WHO
+    /// shows WHO's local view of reputations for A,B,C
+    fn cmd_rep(&self, who: &str) {
+        if let Some(n) = self.node_ref(who) {
+            println!("--- rep seen by {} ---", who);
+            for id in ["A","B","C"] {
+                let score = n.rep.get(&PubKey(id.to_string()));
+                println!("{} -> rep({}) = {:.3}", who, id, score);
+            }
+        } else {
+            eprintln!("no such node {}", who);
+        }
+    }
+
+    /// CLI: fuse WHO
+    /// fuse all retina packets WHO has into a single canonical scene
+    fn cmd_fuse(&self, who: &str) {
+        if let Some(n) = self.node_ref(who) {
+            let retina_packets: Vec<RetinaBody> = n.inbox.iter().filter_map(|m| {
+                if let Content::Retina(ref r) = m.content {
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            }).collect();
+
+            if retina_packets.is_empty() {
+                println!("no retinal packets for {}", who);
+                return;
+            }
+
+            let fused_candidate = fuse_fixations(&retina_packets);
+            match fused_candidate {
+                None => {
+                    println!("fusion failed (None)");
+                }
+                Some(fused) => {
+                    print!("fused_digest = ");
+                    print_digest(&fused.fused_digest);
+                    println!(
+                        "fused_variance_drop = {}  fused_a_hat_len = {}",
+                        fused.fused.cert.fused_variance_drop,
+                        fused.fused.a_hat.len()
+                    );
+                }
+            }
+        } else {
+            eprintln!("no such node {}", who);
+        }
+    }
+}
+
+fn print_digest(d: &Digest) {
+    print!("Digest([");
+    for (i, b) in d.0.iter().enumerate() {
+        if i > 0 { print!(","); }
+        print!("{}", b);
+    }
+    println!("])");
+}
+
+fn print_digest_inline(d: &Digest) {
+    print!("Digest([");
+    for (i, b) in d.0.iter().enumerate() {
+        if i > 0 { print!(","); }
+        print!("{}", b);
+    }
+    print!("])");
+}
+
+fn main() {
+    let mut net = Net::new();
+
+    println!("Collapse Messenger REPL");
+    println!("nodes: A, B, C");
+    println!("commands:");
+    println!("  send_text FROM root|last MESSAGE...");
+    println!("  send_retina FROM root|last");
+    println!("  ack FROM root|last delivered|read");
+    println!("  poll WHO");
+    println!("  inbox WHO");
+    println!("  rep WHO");
+    println!("  fuse WHO");
+    println!("  help");
+    println!("  quit / exit");
+    println!("—");
+
+    let stdin = std::io::stdin();
+    loop {
+        print!("> ");
+        std::io::stdout().flush().unwrap();
+
+        let mut line = String::new();
+        if stdin.read_line(&mut line).is_err() {
+            eprintln!("(io error)");
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        let parts: Vec<&str> = line.split_whitespace().collect();
+
+        match parts[0] {
+            "quit" | "exit" => {
+                println!("bye");
+                break;
+            }
+
+            "help" => {
+                println!("commands:");
+                println!("  send_text FROM root|last MESSAGE...");
+                println!("  send_retina FROM root|last");
+                println!("  ack FROM root|last delivered|read");
+                println!("  poll WHO");
+                println!("  inbox WHO");
+                println!("  rep WHO");
+                println!("  fuse WHO");
+                println!("  help");
+                println!("  quit / exit");
+            }
+
+            "send_text" => {
+                if parts.len() < 4 {
+                    eprintln!("usage: send_text FROM root|last MESSAGE...");
+                } else {
+                    let from = parts[1];
+                    let parent_sel = parts[2];
+                    let msg_body = &parts[3..];
+                    net.cmd_send_text(from, parent_sel, msg_body);
+                }
+            }
+
+            "send_retina" => {
+                if parts.len() != 3 {
+                    eprintln!("usage: send_retina FROM root|last");
+                } else {
+                    let from = parts[1];
+                    let parent_sel = parts[2];
+                    net.cmd_send_retina(from, parent_sel);
+                }
+            }
+
+            "ack" => {
+                if parts.len() != 4 {
+                    eprintln!("usage: ack FROM root|last delivered|read");
+                } else {
+                    let from = parts[1];
+                    let parent_sel = parts[2];
+                    let kind = parts[3];
+                    net.cmd_ack(from, parent_sel, kind);
+                }
+            }
+
+            "poll" => {
+                if parts.len() != 2 {
+                    eprintln!("usage: poll WHO");
+                } else {
+                    net.cmd_poll(parts[1]);
+                }
+            }
+
+            "inbox" => {
+                if parts.len() != 2 {
+                    eprintln!("usage: inbox WHO");
+                } else {
+                    net.cmd_inbox(parts[1]);
+                }
+            }
+
+            "rep" => {
+                if parts.len() != 2 {
+                    eprintln!("usage: rep WHO");
+                } else {
+                    net.cmd_rep(parts[1]);
+                }
+            }
+
+            "fuse" => {
+                if parts.len() != 2 {
+                    eprintln!("usage: fuse WHO");
+                } else {
+                    net.cmd_fuse(parts[1]);
+                }
+            }
+
+            _ => {
+                eprintln!("unknown command {:?}", parts[0]);
+            }
+        }
+    }
+}
